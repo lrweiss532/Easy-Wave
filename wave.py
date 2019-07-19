@@ -12,6 +12,12 @@ class PulseLengthError(Exception):pass
 def is_close(a,b):
     return abs(a-b) < 0.1e-9#For us close enough means within one time step (100ps < 1/1.2e9 should be sufficient)
 
+def to_integer(a):
+    if is_close(a, int(a)):
+        return int(a)
+    else:
+        raise PulseLengthError()
+
 class Channels(Enum):
     ch1_a = (1,0);ch1_m1 = (1,1);ch1_m2 = (1,2);
     ch2_a = (2,0);ch2_m1 = (2,1);ch2_m2 = (2,2);
@@ -27,6 +33,13 @@ class Waveform(object):
         self.wave_list = wave_list
         self.chs = chs
         self.t = sum(wave.t for wave in wave_list)
+
+    def has_ch(self, ch):
+    #This can be used for specific outputs using the enum or for general channels (1,2,3,4) 
+        if type(ch) == int:
+            return any(c.value[0]==ch for c in self.chs)
+        else:
+            return ch in self.chs
 
     def __str__(self):
         return self.repr_str
@@ -119,9 +132,30 @@ class Core_Waveform(Waveform):
 # This will transform the waveforms into AWG lines and then write them to file
 # -------------------------------------------------------------------------------------------------------
 
+
+
 class AWG_Writer(object):
     def __init__(self, filename):
         f = AWG_File_Writer()
+        self.lines = []
+
+    def add_line(self, waveform, name, repeat=None, goto=None, shifts=None, jump_target=None, wait_for_trigger=False, use_sub_seq=False, sub_seq_name='',):
+        self.lines.append({'name':name, 'waveform':waveform,'shifts':shifts
+                           'params':{'repeat':repeat, 'goto':goto, 'jump_target':jump_target,'wait_for_trigger':wait_for_trigger, 'use_sub_seq':use_sub_seq, 'sub_seq_name':sub_seq_name}})
+
+    def generate_and_upload(self, address, remote_filename, rate):
+        zero_lines = dict()
+        for i, line in enumerate(self.lines):
+            line_no = i + 1
+
+            wfm_names = list()
+            for ch in [1,2,3,4]:
+                wfm_len = line['waveform'].t*rate
+                is_close(wfm_len)
+                if line['waveform'].has_ch(ch):
+                    
+
+
 
 class AWG_Line(object):
     def __init__(self, waveform, name, repeat=None, goto=None, shifts=None, jump_target=None):
