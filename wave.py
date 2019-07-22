@@ -4,8 +4,7 @@ from io import BytesIO
 import ftplib
 from collections import OrderedDict
 
-from lantz.drivers.tektronix.awg5014c_tools import AWG_File_Writer
-import lantz.drivers.tektronix.awg5014c_constants as cst
+import wave_sim as sim
 
 DEBUG = False
 
@@ -38,6 +37,8 @@ class Waveform(object):
         self.t = sum(wave.t for wave in wave_list)
         self.repr_str = ('(' + ' + '.join(['{}']*len(wave_list)) + ')').format(*[str(wave) for wave in wave_list])
 
+        self.PULSE_TYPE = None
+
     def has_ch(self, ch):
     #This can be used for specific outputs using the enum or for general channels (1,2,3,4) 
         if type(ch) == int:
@@ -60,6 +61,15 @@ class Waveform(object):
         a = self.wave_list if type(self)==AND_Waveform else [self]
         b = other.wave_list if type(other)==AND_Waveform else [other]
         return AND_Waveform(wave_list = a + b)
+
+    def get_ts(self, rate):
+        wfm_len = self.t*rate
+        wfm_len = to_integer(wfm_len, error=PulseLengthError("Waveform has non-integer length ({}) with respect to rate ({})\n\tWaveform:{}".format(wfm_len, rate, str(self))))
+        return np.linspace(0, self.t, wfm_len, endpoint=False)
+    
+    def generate(self, rate, ch):
+        ts = self.get_ts(rate)
+        return ts, self.generator(ts, rate, ch)
 
     def generator(self,ts,rate,ch):
         if not ch in self.chs:
@@ -141,10 +151,13 @@ class Core_Pulse(Waveform):
         """
         pass
 
-def Packaged_Waveform(func):
+
+def Packaged_Waveform(func, sim_func=None):
     def wrapper(*args, **kwargs):
         w = func(*args, **kwargs)
-        repr_str = func.__name__
+        w.args = args
+        w.kwargs = kwargs
+        w.repr_str = func.__name__
         return w
     return wrapper
 
@@ -165,14 +178,20 @@ DEFAULTS_LIMITS = [(-0.5, 0.5),(0.0, 2.7),(0.0, 2.7)]
 def get_dtype(ch):
     return bool if ch.value[1] > 0 else float
 
+try:
+    from lantz.drivers.tektronix.awg5014c_tools import AWG_File_Writer
+    import lantz.drivers.tektronix.awg5014c_constants as cst
+except:
+    print("Warning: You do not have lantz install with the proper instrument drivers.  You will not be able to generate .awg files for the AWG5014C, but you can still use the generator code")
+
 class AWG_Writer(object):
     def __init__(self):
         self.lines = list()
 
     def add_line(self, waveform, name, repeat=0, goto=0, shifts=None, jump_target=0, wait_for_trigger=False, use_sub_seq=False, sub_seq_name=''):
         self.lines.append({'name':name, 'waveform':waveform,'shifts':shifts,
-                           'params':{'repeat_count':repeat, 'goto_target':goto, 'jump_target':jump_target,
-                                     'wait_for_trigger':wait_for_trigger, 'use_sub_seq':use_sub_seq, 'sub_seq_name':sub_seq_name}})
+                        'params':{'repeat_count':repeat, 'goto_target':goto, 'jump_target':jump_target,
+                                    'wait_for_trigger':wait_for_trigger, 'use_sub_seq':use_sub_seq, 'sub_seq_name':sub_seq_name}})
 
     def generate(self, rate, limits={}):
         file_writer = AWG_File_Writer()
@@ -235,6 +254,4 @@ class AWG_Writer(object):
         ftp.storbinary('STOR {}'.format(remote_filename), sequence_file, blocksize=1024)
         print('uploaded')
         ftp.quit()
-        return
-                    
-        
+        return      
