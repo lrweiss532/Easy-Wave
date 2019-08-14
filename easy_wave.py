@@ -4,8 +4,6 @@ from io import BytesIO
 import ftplib
 from collections import OrderedDict
 
-import wave_sim as sim
-
 DEBUG = False
 
 # -------------------------------------------------------------------------------------------------------
@@ -31,13 +29,13 @@ def to_integer(a, error=PulseLengthError()):
 
 
 class Waveform(object):
+    PULSE_TYPE = None
     def __init__(self, wave_list=[], chs=set()):
         self.wave_list = wave_list
         self.chs = set().union(*[wave.chs for wave in wave_list])
         self.t = sum(wave.t for wave in wave_list)
         self.repr_str = ('(' + ' + '.join(['{}']*len(wave_list)) + ')').format(*[str(wave) for wave in wave_list])
 
-        self.PULSE_TYPE = None
 
     def has_ch(self, ch):
     #This can be used for specific outputs using the enum or for general channels (1,2,3,4) 
@@ -62,6 +60,9 @@ class Waveform(object):
         b = other.wave_list if type(other)==AND_Waveform else [other]
         return AND_Waveform(wave_list = a + b)
 
+    def __mul__(self, integer):
+        return self.repeat(integer)
+
     def get_ts(self, rate):
         wfm_len = self.t*rate
         wfm_len = to_integer(wfm_len, error=PulseLengthError("Waveform has non-integer length ({}) with respect to rate ({})\n\tWaveform:{}".format(wfm_len, rate, str(self))))
@@ -70,6 +71,17 @@ class Waveform(object):
     def generate(self, rate, ch):
         ts = self.get_ts(rate)
         return ts, self.generator(ts, rate, ch)
+
+    def blank(self):
+        return Zero(t=self.t, ch=Channel.no_ch)
+
+    def repeat(self, integer):
+        if type(integer) != int:
+            raise TypeError("Cannot repeat a waveform by something other that is not an integer")
+        out = Empty()
+        for i in range(integer):
+            out += self
+        return out
 
     def generator(self,ts,rate,ch):
         if not ch in self.chs:
@@ -124,6 +136,9 @@ class Core_Pulse(Waveform):
         self.args = args
         self.kwargs = kwargs
 
+        if hasattr(self, 'sim'):
+            self.PULSE_TYPE = self.sim(*args, **kwargs)
+
     def __str__(self):
         return self.__class__.__name__
 
@@ -162,6 +177,9 @@ def Packaged_Waveform(func, sim_func=None):
     return wrapper
 
 
+##This is to allow wave.blank and wave.repeat to work
+from wave_library import Zero, Empty
+
 # -------------------------------------------------------------------------------------------------------
 # This will transform the waveforms into AWG lines and then write them to file.  This part is hardware depedent.  (Here written for the Tektronix AWG 5014C)
 # -------------------------------------------------------------------------------------------------------
@@ -171,6 +189,10 @@ class Channel(Enum):
     ch2_a = (2,0);ch2_m1 = (2,1);ch2_m2 = (2,2);
     ch3_a = (3,0);ch3_m1 = (3,1);ch3_m2 = (3,2);
     ch4_a = (4,0);ch4_m1 = (4,1);ch4_m2 = (4,2);
+    no_ch = (0,0);
+
+REAL_CHANNELS = [ch for ch in Channel]
+REAL_CHANNELS.remove(Channel.no_ch)
 
 CHANNEL_GROUPS = OrderedDict([(i,[Channel['ch{}_{}'.format(i,ch)] for ch in ['a', 'm1', 'm2']]) for i in range(1,5)])
 DEFAULTS_LIMITS = [(-0.5, 0.5),(0.0, 2.7),(0.0, 2.7)]
@@ -184,14 +206,71 @@ try:
 except:
     print("Warning: You do not have lantz install with the proper instrument drivers.  You will not be able to generate .awg files for the AWG5014C, but you can still use the generator code")
 
-class AWG_Writer(object):
-    def __init__(self):
-        self.lines = list()
+class Block_Writer(object):
+    def __init__(self, shifts={}):
+        self.shifts = shifts
+        self.blocks = OrderedDict([])
+        self.cur_block_name = None
+        self.block_size = None
 
-    def add_line(self, waveform, name, repeat=0, goto=0, shifts=None, jump_target=0, wait_for_trigger=False, use_sub_seq=False, sub_seq_name=''):
+    def new_block(self, block_name):
+        self.cur_block_name = block_name
+        self.blocks[block_name] = OrderedDict([])
+    
+    def add_line(self, waveform, sub_name=None, repeat=1):
+        if not len(self.blocks):
+            raise Exception("Must create a new block first using the AWG_Block_writer.new_block function")
+        
+        cur_block_size = len(self.blocks[self.cur_block_name]) + 1
+        if len(self.blocks) == 1:#First block defines the block size
+            self.block_size = cur_block_size
+        if  cur_block_size > self.block_size:
+            raise Exception("Uneven block size")
+        
+        sub_name = 'sub'+str(len(self.lines)) if sub_name is None else sub_name
+        name = self.cur_block_name + '_' + sub_name
+        self.blocks[self.cur_block_name][name] = {'waveform':waveform, 'repeat':repeat}
+
+    def make_awg_writer(self):
+        writer = AWG_Writer(shifts=self.shifts)
+        line_no = 1
+        for bname, lines in self.blocks.items():
+            block_start_line = line_no
+            last_name = list(lines.keys())[-1]
+            for lname, line in lines.items():
+                goto = block_start_line if lname == last_name else line_no + 1
+                writer.add_line(line['waveform'], lname, repeat=line['repeat'], goto=goto)
+                line_no += 1
+        return writer
+
+    def print_info(self):
+        print("This sequence contains {} blocks".format(len(self.blocks)))
+        print("This sequence should be run with:\n\tCountsVsLine where lines=arange(1,{},{})".format(len(self.blocks)*self.block_size, self.block_size))
+    
+    def generate(self, rate, limits={}):
+        return self.make_awg_writer().generate(rate, limits=limits)
+
+    def generate_and_upload(self, address, remote_filename, rate=1e9, limits={}):
+        return self.make_awg_writer().generate_and_upload(address, remote_filename, rate=rate, limits=limits)
+    
+
+class AWG_Writer(object):
+    def __init__(self, shifts={}):
+        self.lines = list()
+        self.default_shifts = shifts
+
+    def add_line(self, waveform, name, repeat=0, goto=0, shifts={}, jump_target=0, wait_for_trigger=False, use_sub_seq=False, sub_seq_name=''):
+        shifts = self.default_shifts if shifts == {} else shifts
         self.lines.append({'name':name, 'waveform':waveform,'shifts':shifts,
-                        'params':{'repeat_count':repeat, 'goto_target':goto, 'jump_target':jump_target,
-                                    'wait_for_trigger':wait_for_trigger, 'use_sub_seq':use_sub_seq, 'sub_seq_name':sub_seq_name}})
+                           'params':{'repeat_count':repeat, 'goto_target':goto, 'jump_target':jump_target,
+                                     'wait_for_trigger':wait_for_trigger, 'use_sub_seq':use_sub_seq, 
+                                     'sub_seq_name':sub_seq_name}})
+
+    def get_line(self, line):
+        return self.lines[line-1]['waveform']
+
+    def __getitem__(self, line):
+        return self.get_line(line)
 
     def generate(self, rate, limits={}):
         file_writer = AWG_File_Writer()
@@ -206,8 +285,14 @@ class AWG_Writer(object):
                 wfm_len = to_integer(wfm_len, error=PulseLengthError("Waveform <{}> channel group <{}> has non-integer length ({}) with respect to rate ({})".format(line['name'],group, wfm_len, rate)))
                 if any([line['waveform'].has_ch(ch) for ch in chs]):
                     name = line['name']+' ch'+str(group)
+
+                    #Compute the integer shift
+                    shifts = {ch:int(round(line['shifts'][ch]*rate)) if ch in line['shifts'] else 0 for ch in chs}
+
+                    # Generate the arrays and add to file
                     ts = np.linspace(0, line['waveform'].t, wfm_len, endpoint=False)
-                    file_writer.add_waveform(name, *[line['waveform'].generator(ts, rate, ch) for ch in chs])# @TODO Add shift
+                    ws = [np.roll(line['waveform'].generator(ts, rate, ch), shifts[ch]) for ch in chs]
+                    file_writer.add_waveform(name, *ws)
                 else:
                     name = 'zeros {}'.format(wfm_len)
                     if not wfm_len in zero_lines:
@@ -218,32 +303,32 @@ class AWG_Writer(object):
             #Add the sequence
             file_writer.add_sequence_line(wfm = wfm_names, **line['params'])
 
-            #Add limits
-            for ch in Channel:
-                lo, hi = limits[ch] if ch in limits else DEFAULTS_LIMITS[ch.value[1]]
-                if ch.value[1] == 0:
-                    records = [
-                        ('ANALOG_METHOD_'+str(ch.value[0]), cst.EAnalogInputMethod.AnalogInputMethod_IMHighLow, 3),
-                        ('ANALOG_LOW_'+str(ch.value[0]), lo, 3),
-                        ('ANALOG_HIGH_'+str(ch.value[0]), hi, 3),
-                    ]
-                else:
-                    records = [
-                        ('MARKER{1}_METHOD_{0}'.format(*ch.value), cst.EMarkerInputMethod.MarkerInputMethod_IMHighLow, 3),
-                        ('MARKER{1}_LOW_{0}'.format(*ch.value), lo, 3),
-                        ('MARKER{1}_HIGH_{0}'.format(*ch.value), hi, 3)
-                    ]
-                for r in records:
-                    file_writer.add_record(*r)
+        #Add limits
+        for ch in REAL_CHANNELS:
+            lo, hi = limits[ch] if ch in limits else DEFAULTS_LIMITS[ch.value[1]]
+            if ch.value[1] == 0:
+                records = [
+                    ('ANALOG_METHOD_'+str(ch.value[0]), cst.EAnalogInputMethod.AnalogInputMethod_IMHighLow, 3),
+                    ('ANALOG_LOW_'+str(ch.value[0]), lo, 3),
+                    ('ANALOG_HIGH_'+str(ch.value[0]), hi, 3),
+                ]
+            else:
+                records = [
+                    ('MARKER{1}_METHOD_{0}'.format(*ch.value), cst.EMarkerInputMethod.MarkerInputMethod_IMHighLow, 3),
+                    ('MARKER{1}_LOW_{0}'.format(*ch.value), lo, 3),
+                    ('MARKER{1}_HIGH_{0}'.format(*ch.value), hi, 3)
+                ]
+            for r in records:
+                file_writer.add_record(*r)
 
-            #Add a few more records
-            file_writer.add_record('SAMPLING_RATE', rate, 2)
-            file_writer.add_record('RUN_MODE', cst.ERunMode.RunMode_SEQUENCE, 2)
+        #Add a few more records
+        file_writer.add_record('SAMPLING_RATE', rate, 2)
+        file_writer.add_record('RUN_MODE', cst.ERunMode.RunMode_SEQUENCE, 2)
 
-            sequence_file = BytesIO()
-            sequence_file.write(file_writer.get_bytes())
-            sequence_file.seek(0)
-            return sequence_file
+        sequence_file = BytesIO()
+        sequence_file.write(file_writer.get_bytes())
+        sequence_file.seek(0)
+        return sequence_file
 
     def generate_and_upload(self, address, remote_filename, rate=1e9, limits={}):
         sequence_file = self.generate(rate=rate, limits=limits)
@@ -254,4 +339,4 @@ class AWG_Writer(object):
         ftp.storbinary('STOR {}'.format(remote_filename), sequence_file, blocksize=1024)
         print('uploaded')
         ftp.quit()
-        return      
+        return self
